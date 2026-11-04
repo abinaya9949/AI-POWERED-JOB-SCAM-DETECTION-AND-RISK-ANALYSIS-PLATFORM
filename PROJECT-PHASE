@@ -1,0 +1,862 @@
+BACKEND:
+main.py:
+"""
+JobShield AI - AI-Powered Job Scam Detection and Risk Analysis Platform
+Backend API - FastAPI application entry point
+"""
+import logging
+import time
+from contextlib import asynccontextmanager
+ 
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+ 
+from database import create_tables
+from auth import router as auth_router
+from routes.analysis import router as analysis_router
+from routes.admin import router as admin_router
+from ml.predictor import load_model
+ 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("jobshield")
+ 
+ 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+logger.info("Starting JobShield AI ...")
+create_tables()
+load_model()          # load TF-IDF + Random Forest pipeline once
+logger.info("System ready.")
+yield
+logger.info("Shutting down ...")
+ 
+ 
+app = FastAPI(
+title="JobShield AI API",
+description="Detect, verify and protect against job scams.",
+version="1.0.0",
+lifespan=lifespan,
+)
+ 
+app.add_middleware(
+CORSMiddleware,
+allow_origins=["http://localhost:5173"],
+allow_credentials=True,
+allow_methods=["*"],
+allow_headers=["*"],
+)
+ 
+ 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+start = time.time()
+response = await call_next(request)
+ms = (time.time() - start) * 1000
+logger.info("%s %s -> %s (%.1f ms)", request.method,
+request.url.path, response.status_code, ms)
+return response
+ 
+ 
+app.include_router(auth_router, prefix="/auth", tags=["Auth"])
+app.include_router(analysis_router, prefix="/api", tags=["Analysis"])
+app.include_router(admin_router, prefix="/api/admin", tags=["Admin"])
+ 
+ 
+@app.get("/health", tags=["Health"])
+def health():
+return {"status": "healthy", "service": "jobshield-ai-api"}
+database.py:
+"""Database models and session handling (SQLAlchemy + SQLite)."""
+import os
+from datetime import datetime
+ 
+from sqlalchemy import (create_engine, Column, Integer, String, Float,
+Text, DateTime, ForeignKey, JSON)
+from sqlalchemy.orm import declarative_base, sessionmaker
+ 
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./jobshield.db")
+engine = create_engine(DATABASE_URL,
+connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autoflush=False)
+Base = declarative_base()
+ 
+ 
+class User(Base):
+__tablename__ = "users"
+id = Column(Integer, primary_key=True)
+full_name = Column(String(100), nullable=False)
+email = Column(String(120), unique=True, index=True, nullable=False)
+hashed_password = Column(String(255), nullable=False)
+role = Column(String(20), default="user")      # user | admin
+created_at = Column(DateTime, default=datetime.utcnow)
+ 
+ 
+class Analysis(Base):
+__tablename__ = "analyses"
+id = Column(Integer, primary_key=True)
+user_id = Column(Integer, ForeignKey("users.id"), index=True)
+job_title = Column(String(200), nullable=False)
+company_name = Column(String(200), nullable=False)
+description = Column(Text, nullable=False)
+location = Column(String(120))
+employment_type = Column(String(40))
+experience = Column(String(60))
+salary_min = Column(Float)
+salary_max = Column(Float)
+currency = Column(String(10), default="USD")
+website_url = Column(String(255))
+recruiter_email = Column(String(120))
+recruiter_name = Column(String(120))
+source = Column(String(80))
+posting_url = Column(String(255))
+ml_label = Column(String(20))          # Genuine | Suspicious
+ml_confidence = Column(Float)
+risk_score = Column(Integer)           # 0 - 100
+risk_level = Column(String(20))        # LOW|MODERATE|HIGH|CRITICAL
+result = Column(JSON)                  # factors, checks, advice
+created_at = Column(DateTime, default=datetime.utcnow)
+ 
+ 
+def create_tables():
+Base.metadata.create_all(bind=engine)
+ 
+ 
+def get_db():
+db = SessionLocal()
+try:
+yield db
+finally:
+db.close()
+auth.py:
+"""Authentication: registration, login, JWT and role-based access."""
+import os
+from datetime import datetime, timedelta
+ 
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+ 
+from database import get_db, User
+ 
+SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret")
+ALGORITHM = "HS256"
+EXPIRE_MINUTES = 60
+ 
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+router = APIRouter()
+ 
+ 
+class RegisterIn(BaseModel):
+full_name: str
+email: str
+password: str
+ 
+ 
+class LoginIn(BaseModel):
+email: str
+password: str
+ 
+ 
+def create_token(user: User) -> str:
+payload = {
+"sub": str(user.id),
+"role": user.role,
+"exp": datetime.utcnow() + timedelta(minutes=EXPIRE_MINUTES),
+}
+return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+ 
+ 
+@router.post("/register")
+def register(data: RegisterIn, db: Session = Depends(get_db)):
+if db.query(User).filter(User.email == data.email).first():
+raise HTTPException(400, "Email already registered")
+user = User(full_name=data.full_name,
+email=data.email,
+hashed_password=pwd_context.hash(data.password))
+db.add(user)
+db.commit()
+db.refresh(user)
+return {"id": user.id, "email": user.email, "role": user.role}
+ 
+ 
+@router.post("/login")
+def login(data: LoginIn, db: Session = Depends(get_db)):
+user = db.query(User).filter(User.email == data.email).first()
+if not user or not pwd_context.verify(data.password,
+user.hashed_password):
+raise HTTPException(401, "Invalid email or password")
+return {
+"access_token": create_token(user),
+"token_type": "bearer",
+"user": {"id": user.id, "name": user.full_name, "role": user.role},
+}
+ 
+ 
+def get_current_user(token: str = Depends(oauth2_scheme),
+db: Session = Depends(get_db)) -> User:
+try:
+payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+user = db.get(User, int(payload["sub"]))
+except (JWTError, KeyError, ValueError):
+raise HTTPException(401, "Invalid or expired token")
+if user is None:
+raise HTTPException(401, "User not found")
+return user
+ 
+ 
+def require_admin(user: User = Depends(get_current_user)) -> User:
+if user.role != "admin":
+raise HTTPException(403, "Administrator access required")
+return user
+risk_engine.py:
+"""Multi-factor risk scoring engine (score 0-100) for JobShield AI."""
+from urllib.parse import urlparse
+ 
+from ml.predictor import predict
+ 
+FREE_MAIL = {"gmail.com", "yahoo.com", "outlook.com", "hotmail.com",
+"aol.com", "rediffmail.com", "proton.me"}
+GUARANTEE = ["guaranteed income", "no interview", "guaranteed salary"]
+URGENCY = ["urgent hiring", "apply immediately", "limited slots", "hurry"]
+PAYMENT = ["registration fee", "processing fee", "security deposit",
+"pay a fee", "training fee"]
+ENTRY_LEVEL = {"", "none", "no experience", "fresher", "entry level"}
+SALARY_CAP = {"USD": 120000, "INR": 2500000, "EUR": 100000}
+ 
+ 
+def risk_level(score: int) -> str:
+if score >= 75:
+return "CRITICAL"
+if score >= 50:
+return "HIGH"
+if score >= 25:
+return "MODERATE"
+return "LOW"
+ 
+ 
+def _hits(text: str, terms: list) -> list:
+return [t for t in terms if t in text]
+ 
+ 
+def analyze_job(job: dict) -> dict:
+text = f"{job['job_title']} {job['description']}".lower()
+factors, checks = [], {}
+ 
+# 1. NLP + Random Forest classifier
+label, conf = predict(text)
+if label == "Suspicious":
+pts = round(conf * 42)
+factors.append(dict(
+text=f"The Random Forest model identified linguistic scam "
+f"patterns with {conf * 100:.1f}% confidence.",
+points=pts, type="Machine Learning", severity="HIGH"))
+ 
+# 2. Deceptive claims, pressure tactics, payment requests
+hit = _hits(text, GUARANTEE)
+if hit:
+factors.append(dict(
+text="Posting advertises guaranteed income without standard "
+"interviews (" + ", ".join(f"'{h}'" for h in hit) + ").",
+points=14, type="Deceptive Claims", severity="MEDIUM"))
+hit = _hits(text, URGENCY)
+if hit:
+factors.append(dict(
+text="High-pressure hiring language detected ('" + hit[0] +
+"') used to prompt hasty action.",
+points=8, type="Pressure Tactic", severity="LOW"))
+hit = _hits(text, PAYMENT)
+if hit:
+factors.append(dict(
+text="Candidate is asked for an upfront payment ('" + hit[0] +
+"').", points=25, type="Payment Request",
+severity="HIGH"))
+ 
+# 3. Recruiter e-mail verification
+email = (job.get("recruiter_email") or "").strip().lower()
+e_dom = email.split("@")[-1] if "@" in email else ""
+c_dom = urlparse(job.get("website_url") or "").netloc.lower()
+c_dom = c_dom.replace("www.", "")
+checks["email"] = {"contact": email, "domain": "@" + e_dom,
+"status": "Verified", "alignment": "Matched"}
+if e_dom in FREE_MAIL:
+checks["email"].update(status="Suspicious",
+alignment="Domain Mismatch / Unmatched")
+factors.append(dict(
+text=f"Recruiter contact is hosted on free public email "
+f"(@{e_dom}). Reputable corporate recruiters typically "
+f"correspond through dedicated enterprise domains.",
+points=20, type="Identity Verification", severity="HIGH"))
+elif c_dom and e_dom and not e_dom.endswith(c_dom):
+checks["email"].update(status="Suspicious",
+alignment="Domain Mismatch / Unmatched")
+factors.append(dict(
+text="Recruiter email domain does not match the company "
+"website domain.", points=20,
+type="Identity Verification", severity="HIGH"))
+ 
+# 4. Company website verification
+if not c_dom:
+checks["website"] = {"claimed_url": "None provided",
+"status": "Unable to Verify"}
+factors.append(dict(
+text="No company website was provided with this job posting. "
+"Unable to verify digital web presence.",
+points=10, type="Company Verification", severity="MEDIUM"))
+else:
+secure = (job["website_url"].startswith("https://"))
+checks["website"] = {"claimed_url": job["website_url"],
+"status": "Verified" if secure else "Weak",
+"transport_security": "HTTPS" if secure
+else "Missing"}
+if not secure:
+factors.append(dict(
+text="Company website does not use HTTPS transport "
+"security.", points=6,
+type="Company Verification", severity="LOW"))
+ 
+# 5. Rule-based salary anomaly detection
+exp = (job.get("experience") or "").strip().lower()
+cap = SALARY_CAP.get(job.get("currency", "USD"), 120000)
+top = job.get("salary_max") or 0
+if exp in ENTRY_LEVEL and top > cap:
+factors.append(dict(
+text=f"Rule-based salary anomaly analysis: Unusually high "
+f"salary ({job['currency']} {int(top):,}) advertised for "
+f"entry-level or no-experience role.",
+points=15, type="Salary Anomaly", severity="HIGH"))
+checks["salary"] = {"status": "High Salary Risk"}
+else:
+checks["salary"] = {"status": "Within Expected Range"}
+ 
+score = min(100, sum(f["points"] for f in factors))
+return {
+"ml_label": label,
+"ml_confidence": round(conf, 3),
+"risk_score": score,
+"risk_level": risk_level(score),
+"factors": factors,
+"checks": checks,
+"recommendations": recommendations(factors),
+}
+ 
+ 
+ADVICE = {
+"Identity Verification": ("Verify Recruiter Identity", "HIGH",
+"Cross-reference the recruiter on LinkedIn or contact the "
+"organization through their official verified public channels."),
+"Company Verification": ("Request Corporate Information", "MEDIUM",
+"Ask the hiring manager for a verified headquarters address, "
+"official web portal, and enterprise references."),
+"Salary Anomaly": ("Benchmark Market Compensation", "MEDIUM",
+"Verify realistic wage ranges for this job title and experience "
+"level on trusted industry portals like Levels.fyi or Glassdoor."),
+"Deceptive Claims": ("Be Skeptical of Guaranteed Offers", "HIGH",
+"Legitimate jobs require structured screening and interviews. "
+"Unsolicited instant job offers are almost always fraudulent."),
+"Payment Request": ("Never Pay Upfront Fees", "HIGH",
+"Genuine employers do not charge candidates for registration, "
+"training or equipment."),
+}
+ 
+ 
+def recommendations(factors: list) -> list:
+seen = {f["type"] for f in factors}
+return [dict(title=t, priority=p, detail=d)
+for k, (t, p, d) in ADVICE.items() if k in seen]
+routes/analysis.py:
+"""Job analysis, history, dashboard and PDF report endpoints."""
+from io import BytesIO
+from typing import Optional
+ 
+from fastapi import APIRouter, Depends, HTTPException, Response
+from pydantic import BaseModel
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+ 
+from auth import get_current_user
+from database import get_db, Analysis, User
+from ml.explain import top_tokens
+from risk_engine import analyze_job
+ 
+router = APIRouter()
+ 
+ 
+class JobIn(BaseModel):
+job_title: str
+company_name: str
+description: str
+location: str = ""
+employment_type: str = "Full-time"
+experience: str = ""
+salary_min: Optional[float] = None
+salary_max: Optional[float] = None
+currency: str = "USD"
+website_url: str = ""
+recruiter_email: str = ""
+recruiter_name: str = ""
+source: str = ""
+posting_url: str = ""
+ 
+ 
+def _own(db: Session, user: User, analysis_id: int) -> Analysis:
+row = db.get(Analysis, analysis_id)
+if not row or (row.user_id != user.id and user.role != "admin"):
+raise HTTPException(404, "Analysis not found")
+return row
+ 
+ 
+@router.post("/analysis")
+def create_analysis(job: JobIn, db: Session = Depends(get_db),
+user: User = Depends(get_current_user)):
+data = job.model_dump()
+result = analyze_job(data)
+result["shap_tokens"] = top_tokens(job.description)
+row = Analysis(user_id=user.id, **data,
+ml_label=result["ml_label"],
+ml_confidence=result["ml_confidence"],
+risk_score=result["risk_score"],
+risk_level=result["risk_level"], result=result)
+db.add(row)
+db.commit()
+db.refresh(row)
+return {"id": row.id, **result}
+ 
+ 
+@router.get("/analysis")
+def history(q: str = "", level: str = "", db: Session = Depends(get_db),
+user: User = Depends(get_current_user)):
+query = db.query(Analysis).filter(Analysis.user_id == user.id)
+if q:
+like = f"%{q}%"
+query = query.filter(Analysis.job_title.ilike(like) |
+Analysis.company_name.ilike(like))
+if level:
+query = query.filter(Analysis.risk_level == level.upper())
+rows = query.order_by(Analysis.id.desc()).all()
+return [dict(id=r.id, job_title=r.job_title, company=r.company_name,
+prediction=r.ml_label, score=r.risk_score,
+level=r.risk_level, date=r.created_at.isoformat())
+for r in rows]
+ 
+ 
+@router.get("/analysis/{analysis_id}")
+def detail(analysis_id: int, db: Session = Depends(get_db),
+user: User = Depends(get_current_user)):
+row = _own(db, user, analysis_id)
+return {"id": row.id, "job_title": row.job_title,
+"company": row.company_name, **row.result}
+ 
+ 
+@router.delete("/analysis/{analysis_id}")
+def remove(analysis_id: int, db: Session = Depends(get_db),
+user: User = Depends(get_current_user)):
+db.delete(_own(db, user, analysis_id))
+db.commit()
+return {"deleted": analysis_id}
+ 
+ 
+@router.get("/dashboard/summary")
+def summary(db: Session = Depends(get_db),
+user: User = Depends(get_current_user)):
+base = db.query(Analysis).filter(Analysis.user_id == user.id)
+tiers = dict(base.with_entities(Analysis.risk_level,
+func.count()).group_by(
+Analysis.risk_level).all())
+return {"total": base.count(),
+"critical": tiers.get("CRITICAL", 0),
+"high": tiers.get("HIGH", 0),
+"moderate": tiers.get("MODERATE", 0),
+"low": tiers.get("LOW", 0),
+"model_scams": base.filter(
+Analysis.ml_label == "Suspicious").count()}
+ 
+ 
+@router.get("/analysis/{analysis_id}/report")
+def report(analysis_id: int, db: Session = Depends(get_db),
+user: User = Depends(get_current_user)):
+row = _own(db, user, analysis_id)
+buf = BytesIO()
+pdf = canvas.Canvas(buf, pagesize=A4)
+y = 800
+pdf.setFont("Helvetica-Bold", 18)
+pdf.drawString(50, y, "JobShield AI - Risk Assessment Report")
+pdf.setFont("Helvetica", 11)
+for line in [f"Report ID: #{row.id}",
+f"Job Title: {row.job_title}",
+f"Company: {row.company_name}",
+f"Risk: {row.risk_score}/100 ({row.risk_level})",
+f"AI Prediction: {row.ml_label} "
+f"({row.ml_confidence * 100:.1f}% conf.)"]:
+y -= 22
+pdf.drawString(50, y, line)
+y -= 30
+pdf.setFont("Helvetica-Bold", 13)
+pdf.drawString(50, y, "Traceable Contributing Factors")
+pdf.setFont("Helvetica", 10)
+for f in row.result["factors"]:
+y -= 18
+pdf.drawString(50, y, f"+{f['points']} pts  [{f['severity']}]  "
+f"{f['text'][:80]}")
+pdf.save()
+return Response(buf.getvalue(), media_type="application/pdf")
+routes/admin.py:
+"""Administrator console: platform-wide analytics and audit log."""
+from collections import Counter
+ 
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+ 
+from auth import require_admin
+from database import get_db, User, Analysis
+ 
+router = APIRouter(dependencies=[Depends(require_admin)])
+ 
+ 
+@router.get("/overview")
+def overview(db: Session = Depends(get_db)):
+rows = db.query(Analysis).order_by(Analysis.id.desc()).all()
+indicators = Counter(f["type"] for r in rows
+for f in r.result.get("factors", []))
+return {
+"registered_users": db.query(User).count(),
+"total_analyses": len(rows),
+"critical_threats": sum(r.risk_level == "CRITICAL" for r in rows),
+"genuine_jobs": sum(r.ml_label == "Genuine" for r in rows),
+"common_indicators": indicators.most_common(8),
+"audit_log": [dict(id=r.id, job_title=r.job_title,
+company=r.company_name,
+prediction=r.ml_label, score=r.risk_score,
+level=r.risk_level) for r in rows],
+}
+ML & DATA:
+ml/train_model.py:
+"""Train the TF-IDF + Random Forest job scam classifier."""
+from pathlib import Path
+ 
+import joblib
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+ 
+from ml.predictor import clean_text, MODEL_PATH
+ 
+DATASET = Path("data/fake_job_postings.csv")   # public EMSCAD dataset
+TEXT_COLS = ["title", "company_profile", "description",
+"requirements", "benefits"]
+ 
+ 
+def main():
+df = pd.read_csv(DATASET)
+df[TEXT_COLS] = df[TEXT_COLS].fillna("")
+df["text"] = df[TEXT_COLS].agg(" ".join, axis=1).map(clean_text)
+X_train, X_test, y_train, y_test = train_test_split(
+df["text"], df["fraudulent"], test_size=0.2,
+stratify=df["fraudulent"], random_state=42)
+ 
+model = Pipeline([
+("tfidf", TfidfVectorizer(max_features=3000, ngram_range=(1, 2),
+stop_words="english")),
+("rf", RandomForestClassifier(n_estimators=300,
+class_weight="balanced_subsample",
+random_state=42, n_jobs=-1)),
+])
+model.fit(X_train, y_train)
+ 
+pred = model.predict(X_test)
+print(classification_report(y_test, pred, digits=3))
+print(confusion_matrix(y_test, pred))
+ 
+MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+joblib.dump(model, MODEL_PATH)
+print("Model saved to", MODEL_PATH)
+ 
+ 
+if __name__ == "__main__":
+main()
+ml/predictor.py:
+"""Load the trained pipeline and classify job posting text."""
+import re
+from pathlib import Path
+ 
+import joblib
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+ 
+MODEL_PATH = Path(__file__).parent / "artifacts" / "job_scam_rf.joblib"
+for _pkg in ("stopwords", "wordnet"):
+nltk.download(_pkg, quiet=True)
+_STOP = set(stopwords.words("english"))
+_LEMMA = WordNetLemmatizer()
+_model = None
+ 
+ 
+def clean_text(text: str) -> str:
+"""Lower-case, tokenize, remove stop-words and lemmatize."""
+text = (text or "").lower()
+text = re.sub(r"https?://\S+", " ", text)
+tokens = re.findall(r"[a-z]+", text)                 # tokenization
+tokens = [_LEMMA.lemmatize(t) for t in tokens
+if t not in _STOP and len(t) > 1]          # stop-words
+return " ".join(tokens)
+ 
+ 
+def load_model():
+global _model
+if _model is None:
+_model = joblib.load(MODEL_PATH)
+return _model
+ 
+ 
+def predict(text: str):
+"""Return (label, confidence) for a job posting."""
+model = load_model()
+proba = model.predict_proba([clean_text(text)])[0]
+scam_p = float(proba[list(model.classes_).index(1)])
+if scam_p >= 0.5:
+return "Suspicious", scam_p
+return "Genuine", 1.0 - scam_p
+ml/explain.py:
+"""Explainable AI: SHAP token contributions for a prediction."""
+import numpy as np
+import shap
+ 
+from ml.predictor import load_model, clean_text
+ 
+ 
+def top_tokens(text: str, k: int = 5):
+model = load_model()
+tfidf, rf = model.named_steps["tfidf"], model.named_steps["rf"]
+X = tfidf.transform([clean_text(text)]).toarray()
+sv = shap.TreeExplainer(rf).shap_values(X)
+# SHAP output layout differs between library versions
+vals = sv[1][0] if isinstance(sv, list) else sv[0, :, 1]
+names = tfidf.get_feature_names_out()
+idx = np.argsort(-np.abs(vals))[:k]
+return [{"token": str(names[i]), "shap": round(float(vals[i]), 4)}
+for i in idx]
+FRONTEND:
+api.js:
+import axios from "axios";
+ 
+const api = axios.create({ baseURL: "http://localhost:8000" });
+ 
+api.interceptors.request.use((config) => {
+const token = localStorage.getItem("token");
+if (token) config.headers.Authorization = `Bearer ${token}`;
+return config;
+});
+ 
+export default api;
+LoginPage.jsx:
+import { useState } from "react";
+import { useNavigate, Link } from "react-router-dom";
+import { Shield, Mail, Lock, ArrowRight } from "lucide-react";
+import api from "./api";
+ 
+export default function LoginPage() {
+const [email, setEmail] = useState("");
+const [password, setPassword] = useState("");
+const [error, setError] = useState("");
+const navigate = useNavigate();
+ 
+const handleSubmit = async (e) => {
+e.preventDefault();
+try {
+const { data } = await api.post("/auth/login", { email, password });
+localStorage.setItem("token", data.access_token);
+localStorage.setItem("user", JSON.stringify(data.user));
+navigate("/dashboard");
+} catch (err) {
+setError(err.response?.data?.detail || "Login failed");
+}
+};
+ 
+return (
+<div className="min-h-screen bg-slate-950 flex items-center
+justify-center">
+<form onSubmit={handleSubmit}
+className="w-full max-w-md rounded-2xl border
+border-slate-800 bg-slate-900 p-8">
+<div className="mx-auto mb-4 flex h-14 w-14 items-center
+justify-center rounded-xl bg-cyan-500">
+<Shield className="text-white" />
+</div>
+<h1 className="text-center text-2xl font-bold text-white">
+Sign in to JobShield AI
+</h1>
+<p className="mb-6 text-center text-sm text-slate-400">
+Access your risk dashboards, analysis history, and alerts
+</p>
+ 
+<label className="text-sm font-semibold text-slate-300">
+Email Address
+</label>
+<div className="mb-4 flex items-center gap-2 rounded-xl
+bg-slate-100 px-3 py-3">
+<Mail size={16} />
+<input type="email" value={email} required
+onChange={(e) => setEmail(e.target.value)}
+className="w-full bg-transparent outline-none" />
+</div>
+ 
+<label className="text-sm font-semibold text-slate-300">
+Password
+</label>
+<div className="mb-4 flex items-center gap-2 rounded-xl
+bg-slate-100 px-3 py-3">
+<Lock size={16} />
+<input type="password" value={password} required
+onChange={(e) => setPassword(e.target.value)}
+className="w-full bg-transparent outline-none" />
+</div>
+ 
+{error && <p className="mb-3 text-sm text-red-400">{error}</p>}
+ 
+<button type="submit"
+className="flex w-full items-center justify-center
+gap-2 rounded-xl bg-gradient-to-r
+from-cyan-500 to-blue-600 py-3
+font-semibold text-white">
+Sign In <ArrowRight size={16} />
+</button>
+<p className="mt-5 text-center text-sm text-slate-400">
+Don't have an account?{" "}
+<Link to="/register" className="text-cyan-400">
+Create an account
+</Link>
+</p>
+</form>
+</div>
+);
+}
+AnalyzePage.jsx:
+import { useState } from "react";
+import { useNavigate } from "react-router-dom";
+import api from "./api";
+ 
+const PRESETS = [
+{ label: "Safe Genuine Job: Senior Python Engineer (Stripe)",
+job_title: "Senior Python Backend Engineer",
+company_name: "Stripe, Inc.", experience: "5+ years",
+description: "Build and maintain payment APIs. Interviews: 4 rounds.",
+salary_min: 150000, salary_max: 190000, currency: "USD",
+website_url: "https://stripe.com",
+recruiter_email: "talent@stripe.com" },
+{ label: "Critical Scam: Unrealistic Salary & Check Deposit",
+job_title: "Executive Courier & Financial Assistant",
+company_name: "Private Wealth Syndicate", experience: "None",
+description: "Urgent hiring! Earn $5,000/week working 2 hours per "
++ "day from home. No interview required! Guaranteed income!",
+salary_min: 180000, salary_max: 250000, currency: "USD",
+website_url: "", recruiter_email: "kane.wealth.mgmt@yahoo.com" },
+];
+ 
+const EMPTY = {
+job_title: "", company_name: "", description: "", location: "",
+employment_type: "Full-time", experience: "", salary_min: "",
+salary_max: "", currency: "USD", website_url: "",
+recruiter_email: "", recruiter_name: "", source: "", posting_url: "",
+};
+ 
+export default function AnalyzePage() {
+const [form, setForm] = useState(EMPTY);
+const [loading, setLoading] = useState(false);
+const navigate = useNavigate();
+ 
+const update = (e) =>
+setForm({ ...form, [e.target.name]: e.target.value });
+ 
+const submit = async (e) => {
+e.preventDefault();
+setLoading(true);
+try {
+const payload = {
+...form,
+salary_min: form.salary_min ? Number(form.salary_min) : null,
+salary_max: form.salary_max ? Number(form.salary_max) : null,
+};
+const { data } = await api.post("/api/analysis", payload);
+navigate(`/result/${data.id}`);
+} finally {
+setLoading(false);
+}
+};
+ 
+const Field = ({ name, label, required, ...rest }) => (
+<div className="flex flex-col gap-1">
+<label className="text-xs text-slate-400">
+{label}{required && <span className="text-red-400"> *</span>}
+</label>
+<input name={name} value={form[name]} onChange={update}
+required={required} {...rest}
+className="rounded-lg border border-slate-700 bg-slate-900
+px-3 py-2 text-sm text-white" />
+</div>
+);
+ 
+return (
+<form onSubmit={submit} className="mx-auto max-w-4xl p-6 space-y-6">
+<h1 className="text-3xl font-bold text-white">
+Analyze a Job Posting
+</h1>
+ 
+<section className="rounded-xl border border-slate-800 p-4">
+<p className="mb-2 text-xs text-cyan-400">
+PRE-CONFIGURED TEST SAMPLES
+</p>
+<div className="grid grid-cols-2 gap-3">
+{PRESETS.map((p) => (
+<button type="button" key={p.label}
+onClick={() => setForm({ ...EMPTY, ...p })}
+className="rounded-lg border border-slate-700 p-3
+text-left text-xs text-slate-200">
+{p.label} <span className="text-cyan-400">Load</span>
+</button>
+))}
+</div>
+</section>
+ 
+<section className="grid grid-cols-2 gap-4">
+<Field name="job_title" label="Job Title" required />
+<Field name="company_name" label="Company Name" required />
+<textarea name="description" value={form.description}
+onChange={update} required rows={5}
+placeholder="Full job description *"
+className="col-span-2 rounded-lg border
+border-slate-700 bg-slate-900 p-3
+text-sm text-white" />
+<Field name="location" label="Location" />
+<Field name="experience" label="Experience Required" />
+</section>
+ 
+<section className="grid grid-cols-3 gap-4">
+<Field name="salary_min" label="Minimum Salary" type="number" />
+<Field name="salary_max" label="Maximum Salary" type="number" />
+<Field name="currency" label="Currency" />
+</section>
+ 
+<section className="grid grid-cols-2 gap-4">
+<Field name="website_url" label="Company Website URL" />
+<Field name="recruiter_email" label="Recruiter Contact Email" />
+<Field name="recruiter_name" label="Recruiter Name" />
+<Field name="source" label="Job Portal / Source" />
+</section>
+ 
+<button disabled={loading}
+className="rounded-xl bg-gradient-to-r from-cyan-500
+to-blue-600 px-6 py-3 font-semibold text-white">
+{loading ? "Analyzing..." : "Analyze Job Posting"}
+</button>
+</form>
+);
+}
